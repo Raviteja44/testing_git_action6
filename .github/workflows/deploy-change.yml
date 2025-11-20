@@ -44,9 +44,8 @@ jobs:
         run: |
           set -e
 
-          # Resolve FEATURE_BRANCH:
+          # Resolve FEATURE_BRANCH
           if [ -n "${{ github.event.inputs.feature_branch }}" ]; then
-            echo "FEATURE_BRANCH_INPUT=${{ github.event.inputs.feature_branch }}" >> $GITHUB_ENV
             echo "FEATURE_BRANCH=${{ github.event.inputs.feature_branch }}" >> $GITHUB_ENV
           elif [ -n "${{ github.head_ref }}" ]; then
             echo "FEATURE_BRANCH=${{ github.head_ref }}" >> $GITHUB_ENV
@@ -55,30 +54,30 @@ jobs:
             echo "FEATURE_BRANCH=${REF_NAME}" >> $GITHUB_ENV
           fi
 
-          # Resolve BASE_BRANCH (target for PR/comparison)
+          # Resolve BASE_BRANCH
           if [ -n "${{ github.event.inputs.environment }}" ]; then
             echo "BASE_BRANCH=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
           else
             echo "BASE_BRANCH=dev" >> $GITHUB_ENV
           fi
-
-          echo "Resolved FEATURE_BRANCH=${FEATURE_BRANCH}"
-          echo "Resolved BASE_BRANCH=${BASE_BRANCH}"
         shell: bash
 
       - name: If manual run, fetch & checkout requested feature branch
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -e
-          echo "Manual dispatch: fetching feature branch '${{ env.FEATURE_BRANCH }}'"
-          # If input uses owner:branch, only try to fetch local branch name (right side)
-          if [[ "${{ env.FEATURE_BRANCH }}" == *:* ]]; then
-            BRANCH="${{ env.FEATURE_BRANCH#*: }}"
+          echo "Manual dispatch: feature branch '$FEATURE_BRANCH'"
+
+          # Handle owner:branch inside bash (NOT inside GitHub expression)
+          if [[ "$FEATURE_BRANCH" == *:* ]]; then
+            BRANCH="${FEATURE_BRANCH#*:}"
           else
-            BRANCH="${{ env.FEATURE_BRANCH }}"
+            BRANCH="$FEATURE_BRANCH"
           fi
-          git fetch origin "${BRANCH}" || true
-          git checkout -B "${BRANCH}" "origin/${BRANCH}" || git checkout -B "${BRANCH}"
+
+          echo "Checking out branch: $BRANCH"
+          git fetch origin "$BRANCH" || true
+          git checkout -B "$BRANCH" "origin/$BRANCH" || git checkout -B "$BRANCH"
           git rev-parse --abbrev-ref HEAD
         shell: bash
 
@@ -87,9 +86,10 @@ jobs:
         run: |
           set -e
           BASE="${BASE_BRANCH:-dev}"
-          echo "Comparing against base branch: $BASE"
+          echo "Comparing vs base branch: $BASE"
+
           git fetch origin "$BASE" || true
-          CHANGED_FILES="$(git diff --name-only origin/${BASE}...HEAD || true)"
+          CHANGED_FILES="$(git diff --name-only origin/$BASE...HEAD || true)"
 
           if [ -z "$CHANGED_FILES" ]; then
             echo "changed_files=" >> "$GITHUB_OUTPUT"
@@ -117,63 +117,47 @@ jobs:
           CHANGE_COUNT: ${{ steps.changes.outputs.change_count }}
         with:
           script: |
-            // Resolve feature branch input
+            // Resolve source branch
             const rawFeature = (process.env.FEATURE_BRANCH || '').trim();
-            if (!rawFeature) throw new Error('FEATURE_BRANCH is empty. Provide a valid branch name.');
+            if (!rawFeature) throw new Error("FEATURE_BRANCH is empty.");
 
-            // Support "owner:branch" (for forks) or just "branch"
             let owner = context.repo.owner;
             let headBranchName = rawFeature;
-            let headParam = rawFeature; // default sent to PR API
+            let headParam = rawFeature;
 
+            // Handle owner:branch
             if (rawFeature.includes(':')) {
-              const parts = rawFeature.split(':');
-              if (parts.length !== 2 || !parts[0] || !parts[1]) {
-                throw new Error('feature_branch must be "owner:branch" if using a fork; invalid format: ' + rawFeature);
-              }
-              owner = parts[0];
-              headBranchName = parts[1];
-              headParam = `${owner}:${headBranchName}`;
+              const [o, b] = rawFeature.split(':');
+              owner = o;
+              headBranchName = b;
+              headParam = `${o}:${b}`;
             }
 
-            // Validate the head branch exists
+            // Validate branch exists
             try {
-              // If owner is the same repo owner, check branch in the current repo
-              if (owner === context.repo.owner) {
-                await github.rest.repos.getBranch({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  branch: headBranchName
-                });
-              } else {
-                // Validate branch exists in the other owner's repo (likely a fork)
-                await github.rest.repos.getBranch({
-                  owner,
-                  repo: context.repo.repo,
-                  branch: headBranchName
-                });
-              }
+              await github.rest.repos.getBranch({
+                owner,
+                repo: context.repo.repo,
+                branch: headBranchName
+              });
             } catch (err) {
-              // Provide a clear error for the user
               throw new Error(
-                `The specified source branch "${rawFeature}" does not exist or is not accessible. ` +
-                `If the branch lives in a fork, provide it as "owner:branch" and ensure the branch/repo is public or the token has access.`
+                `Branch "${rawFeature}" does not exist or is not accessible. Use "owner:branch" for forks.`
               );
             }
 
-            // Prepare changed files list and count
-            const changedFiles = process.env.CHANGED_FILES ? process.env.CHANGED_FILES.split('\n').filter(Boolean) : [];
+            const changedFiles = process.env.CHANGED_FILES
+              ? process.env.CHANGED_FILES.split('\n').filter(Boolean)
+              : [];
             const changeCount = Number(process.env.CHANGE_COUNT || changedFiles.length || 0);
 
             if (changeCount === 0) {
-              console.log(`No changes detected vs ${process.env.BASE_BRANCH || 'dev'} — skipping PR creation.`);
+              console.log(`No changes detected; skipping PR creation.`);
               return;
             }
 
-            // Determine base branch (use BASE_BRANCH env resolved earlier)
-            const baseBranch = (process.env.BASE_BRANCH && process.env.BASE_BRANCH.trim()) || 'dev';
+            const baseBranch = process.env.BASE_BRANCH || 'dev';
 
-            // Avoid duplicate PRs
             const existing = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -182,42 +166,38 @@ jobs:
               state: 'open'
             });
 
-            if (existing.data && existing.data.length > 0) {
-              console.log(`Open PR already exists: ${existing.data[0].html_url}`);
+            if (existing.data.length > 0) {
+              console.log(`PR already exists: ${existing.data[0].html_url}`);
               return;
             }
 
-            // Compose PR body
-            const prBodyLines = [
+            const prBody = [
               `## Feature Deployment to ${baseBranch.toUpperCase()}`,
               `**Source Branch:** ${rawFeature}`,
               `**Target Environment:** ${baseBranch.toUpperCase()}`,
-              `**Deployment Reason:** ${process.env.DEPLOYMENT_REASON || 'Automated PR'}`,
-              '',
-              `### Changes included (${changeCount} files):`,
+              `**Deployment Reason:** ${process.env.DEPLOYMENT_REASON || 'Automated'}`,
+              ``,
+              `### Changed files (${changeCount}):`,
               '```',
               ...changedFiles,
               '```',
-              '',
-              '**CODEOWNERS review required for deployment**'
-            ];
-            const prBody = prBodyLines.join('\n');
+              ``,
+              `**CODEOWNERS review required**`
+            ].join('\n');
 
-            // Create PR
             const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🚀 ${baseBranch.toUpperCase()}: Merge ${rawFeature} -> ${baseBranch}`,
+              title: `🚀 ${baseBranch.toUpperCase()}: Merge ${rawFeature} → ${baseBranch}`,
               body: prBody,
               head: headParam,
               base: baseBranch
             });
 
-            console.log(`✅ Deployment PR created: ${pr.html_url}`);
+            console.log(`Created PR: ${pr.html_url}`);
 
       - name: Deploy to Dev (simulated)
         if: ${{ env.BASE_BRANCH == 'dev' || github.event_name == 'push' }}
         run: |
           echo "🚀 (Simulated) Deploy to DEV"
-          echo "Files changed: ${{ steps.changes.outputs.change_count }}"
-          # Add your actual deployment commands for DEV here
+          echo "Changed files: ${{ steps.changes.outputs.change_count }}"
