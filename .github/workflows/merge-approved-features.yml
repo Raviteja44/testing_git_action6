@@ -1,0 +1,45 @@
+name: Merge / Deploy After Approved PR
+
+on:
+  pull_request:
+    branches:
+      - uat
+      - prod
+    types:
+      - closed
+
+permissions:
+  contents: write
+
+jobs:
+  on-approved-merge:
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.pull_request.base.ref }}
+
+    steps:
+      - name: Checkout target branch (the branch that received the merged PR)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Show merged PR info
+        run: |
+          echo "Merged PR #${{ github.event.pull_request.number }} into ${{ github.event.pull_request.base.ref }}"
+          echo "Merged from ${GITHUB_ACTOR}/${{ github.event.pull_request.head.ref }}"
+          echo "Title: ${{ github.event.pull_request.title }}"
+
+      - name: Deployment step for environment
+        run: |
+          echo "✅ PR merged into ${{ github.event.pull_request.base.ref }} — run deployment tasks here."
+          # Replace the following with your real deployment commands for this environment:
+          # e.g., call deployment script, cloud provider CLI, etc.
+          # Example placeholder:
+          echo "Deploying commit ${{ github.event.pull_request.merge_commit_sha }} to environment ${{ github.event.pull_request.base.ref }}"
+
+      # Optional: If you want to automatically merge this environment to the next (dangerous, commented)
+      # - name: Auto-merge to next environment (optional)
+      #   run: |
+      #     echo "Optional: merge ${{ github.event.pull_request.base.ref }} into next-env"
+      #     # Implement git merge/push with care; requires proper permissions and checks.
