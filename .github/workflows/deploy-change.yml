@@ -49,7 +49,7 @@ jobs:
             OWNER="${SOURCE_BRANCH%%:*}"
             BRANCH="${SOURCE_BRANCH#*:}"
             echo "Using fork branch: owner=$OWNER branch=$BRANCH"
-            git remote add fork "https://github.com/$OWNER/${{ github.repository#*/ }}" || true
+            git remote add fork "https://github.com/$OWNER/${{ github.event.repository.name }}" || true
             git fetch fork "$BRANCH"
             git fetch origin "$TARGET_BRANCH"
             git checkout -B source-branch "fork/$BRANCH"
