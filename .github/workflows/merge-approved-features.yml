@@ -1,0 +1,38 @@
+name: Merge Approved Change Deployment
+
+on:
+  pull_request:
+    branches: [uat, prod]
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  merge-feature:
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.base_ref }}
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Merge the feature branch
+        run: |
+          # Merge the specific feature branch that was approved
+          git merge --no-ff ${{ github.head_ref }} -m "Merge feature ${{ github.head_ref }} to ${{ github.base_ref }}"
+          git push origin ${{ github.base_ref }}
+
+      - name: Final deployment
+        run: |
+          echo "✅ Feature ${{ github.head_ref }} successfully merged to ${{ github.base_ref }}"
+          echo "🎉 Deployment to ${{ github.base_ref }} environment completed"

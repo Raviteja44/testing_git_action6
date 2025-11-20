@@ -1,0 +1,159 @@
+name: Deploy Feature to Environment
+
+on:
+  push:
+    branches-ignore:
+      - dev
+      - uat
+      - prod
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - uat
+          - prod
+      feature_branch:
+        description: 'Feature branch to deploy'
+        required: true
+        type: string
+      deployment_reason:
+        description: 'Reason for deployment'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  deploy-feature:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: If manual run, fetch & checkout requested feature branch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -e
+          echo "Manual dispatch: fetching feature branch '${{ github.event.inputs.feature_branch }}'"
+          git fetch origin "${{ github.event.inputs.feature_branch }}" || true
+          git checkout -b "${{ github.event.inputs.feature_branch }}" "origin/${{ github.event.inputs.feature_branch }}" || git checkout "${{ github.event.inputs.feature_branch }}" || true
+          git rev-parse --abbrev-ref HEAD
+
+      - name: Determine feature branch
+        id: determine_branch
+        run: |
+          # Prefer explicit workflow input (only present for workflow_dispatch)
+          if [ -n "${{ github.event.inputs.feature_branch }}" ]; then
+            echo "Using workflow input feature_branch=${{ github.event.inputs.feature_branch }}"
+            echo "FEATURE_BRANCH=${{ github.event.inputs.feature_branch }}" >> $GITHUB_ENV
+          # For PR events github.head_ref contains the source branch; for push events it is empty
+          elif [ -n "${{ github.head_ref }}" ]; then
+            echo "Using github.head_ref=${{ github.head_ref }}"
+            echo "FEATURE_BRANCH=${{ github.head_ref }}" >> $GITHUB_ENV
+          else
+            # For push events, use GITHUB_REF (refs/heads/branch) and strip the prefix
+            REF_NAME="${GITHUB_REF#refs/heads/}"
+            echo "Using GITHUB_REF branch=${REF_NAME}"
+            echo "FEATURE_BRANCH=${REF_NAME}" >> $GITHUB_ENV
+          fi
+          # echo resolved value to logs for debugging
+          echo "Resolved FEATURE_BRANCH=${FEATURE_BRANCH}"
+        shell: bash
+
+      - name: Get changes vs dev
+        id: changes
+        run: |
+          set -e
+          git fetch origin dev || true
+          CHANGED_FILES=$(git diff --name-only origin/dev...HEAD || true)
+          echo "changed_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          CHANGE_COUNT=$(echo "$CHANGED_FILES" | grep -cve '^\s*$' || echo 0)
+          echo "change_count=$CHANGE_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Create Deployment PR to dev (if applicable)
+        if: ${{ github.event.inputs.environment != 'dev' || github.event_name == 'push' }}
+        uses: actions/github-script@v7
+        env:
+          FEATURE_BRANCH: ${{ env.FEATURE_BRANCH }}
+          TARGET_ENV: ${{ github.event.inputs.environment }}
+          DEPLOYMENT_REASON: ${{ github.event.inputs.deployment_reason }}
+          CHANGED_FILES: ${{ steps.changes.outputs.changed_files }}
+          CHANGE_COUNT: ${{ steps.changes.outputs.change_count }}
+        with:
+          script: |
+            // Guard: ensure FEATURE_BRANCH is present
+            const featureBranch = process.env.FEATURE_BRANCH;
+            if (!featureBranch || featureBranch.trim() === '') {
+              throw new Error(`FEATURE_BRANCH is empty — cannot create pull request. Resolved FEATURE_BRANCH='${featureBranch}'`);
+            }
+
+            const changedFiles = process.env.CHANGED_FILES
+              ? process.env.CHANGED_FILES.split('\n').filter(Boolean)
+              : [];
+            const changeCount = Number(process.env.CHANGE_COUNT || changedFiles.length || 0);
+
+            if (changeCount === 0) {
+              core.info('No changes detected vs dev — skipping PR creation.');
+              return;
+            }
+
+            const prBodyParts = [];
+            prBodyParts.push('## Feature Deployment to ' + (process.env.TARGET_ENV ? process.env.TARGET_ENV.toUpperCase() : 'DEV'));
+            prBodyParts.push('**Source Branch:** ' + featureBranch);
+            prBodyParts.push('**Target Environment:** ' + (process.env.TARGET_ENV ? process.env.TARGET_ENV.toUpperCase() : 'DEV'));
+            prBodyParts.push('**Deployment Reason:** ' + (process.env.DEPLOYMENT_REASON || 'Automated PR'));
+            prBodyParts.push('');
+            prBodyParts.push('### Changes included (' + changeCount + ' files):');
+            prBodyParts.push('```');
+            prBodyParts.push(changedFiles.join('\n'));
+            prBodyParts.push('```');
+            prBodyParts.push('');
+            prBodyParts.push('**CODEOWNERS review required for deployment**');
+
+            const prBody = prBodyParts.join('\n');
+
+            const baseBranch = 'dev';
+            const headBranch = featureBranch;
+
+            // Avoid creating duplicate PRs
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${headBranch}`,
+              base: baseBranch,
+              state: 'open'
+            });
+
+            if (existing.data && existing.data.length > 0) {
+              console.log(`Open PR already exists: ${existing.data[0].html_url}`);
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚀 DEV: Merge ${headBranch} -> ${baseBranch}`,
+              body: prBody,
+              head: headBranch,
+              base: baseBranch
+            });
+
+            console.log(`✅ Deployment PR created: ${pr.html_url}`);
+
+      - name: Deploy to Dev (local/test step)
+        if: ${{ github.event.inputs.environment == 'dev' || github.event_name == 'push' }}
+        run: |
+          echo "🚀 (Simulated) Deploy to DEV"
+          echo "Files changed: ${{ steps.changes.outputs.change_count }}"
+          # Place your deployment commands here
