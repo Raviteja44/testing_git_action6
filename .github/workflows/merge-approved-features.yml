@@ -1,38 +1,45 @@
-name: Merge Approved Change Deployment
+name: Merge / Deploy After Approved PR
 
 on:
   pull_request:
-    branches: [uat, prod]
-    types: [closed]
+    branches:
+      - uat
+      - prod
+    types:
+      - closed
 
 permissions:
   contents: write
 
 jobs:
-  merge-feature:
+  on-approved-merge:
     if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
-    environment: ${{ github.base_ref }}
+    environment: ${{ github.event.pull_request.base.ref }}
 
     steps:
-      - name: Checkout target branch
+      - name: Checkout target branch (the branch that received the merged PR)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.base_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
 
-      - name: Configure git
+      - name: Show merged PR info
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          echo "Merged PR #${{ github.event.pull_request.number }} into ${{ github.event.pull_request.base.ref }}"
+          echo "Merged from ${GITHUB_ACTOR}/${{ github.event.pull_request.head.ref }}"
+          echo "Title: ${{ github.event.pull_request.title }}"
 
-      - name: Merge the feature branch
+      - name: Deployment step for environment
         run: |
-          # Merge the specific feature branch that was approved
-          git merge --no-ff ${{ github.head_ref }} -m "Merge feature ${{ github.head_ref }} to ${{ github.base_ref }}"
-          git push origin ${{ github.base_ref }}
+          echo "✅ PR merged into ${{ github.event.pull_request.base.ref }} — run deployment tasks here."
+          # Replace the following with your real deployment commands for this environment:
+          # e.g., call deployment script, cloud provider CLI, etc.
+          # Example placeholder:
+          echo "Deploying commit ${{ github.event.pull_request.merge_commit_sha }} to environment ${{ github.event.pull_request.base.ref }}"
 
-      - name: Final deployment
-        run: |
-          echo "✅ Feature ${{ github.head_ref }} successfully merged to ${{ github.base_ref }}"
-          echo "🎉 Deployment to ${{ github.base_ref }} environment completed"
+      # Optional: If you want to automatically merge this environment to the next (dangerous, commented)
+      # - name: Auto-merge to next environment (optional)
+      #   run: |
+      #     echo "Optional: merge ${{ github.event.pull_request.base.ref }} into next-env"
+      #     # Implement git merge/push with care; requires proper permissions and checks.
