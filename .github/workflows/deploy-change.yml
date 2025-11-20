@@ -2,7 +2,6 @@ name: Deploy Feature to Environment
 
 on:
   push:
-    # allow testing from feature branches; skip pushes to environment branches
     branches-ignore:
       - dev
       - uat
@@ -18,7 +17,7 @@ on:
           - uat
           - prod
       feature_branch:
-        description: 'Feature branch to deploy'
+        description: 'Feature branch to deploy (use "owner:branch" for fork branches)'
         required: true
         type: string
       deployment_reason:
@@ -44,24 +43,20 @@ jobs:
         id: prepare
         run: |
           set -e
-          # Determine FEATURE_BRANCH:
+
+          # Resolve FEATURE_BRANCH:
           if [ -n "${{ github.event.inputs.feature_branch }}" ]; then
-            echo "Using workflow_dispatch input feature_branch='${{ github.event.inputs.feature_branch }}'"
+            echo "FEATURE_BRANCH_INPUT=${{ github.event.inputs.feature_branch }}" >> $GITHUB_ENV
             echo "FEATURE_BRANCH=${{ github.event.inputs.feature_branch }}" >> $GITHUB_ENV
           elif [ -n "${{ github.head_ref }}" ]; then
-            echo "Using github.head_ref='${{ github.head_ref }}'"
             echo "FEATURE_BRANCH=${{ github.head_ref }}" >> $GITHUB_ENV
           else
             REF_NAME="${GITHUB_REF#refs/heads/}"
-            echo "Using GITHUB_REF branch='${REF_NAME}'"
             echo "FEATURE_BRANCH=${REF_NAME}" >> $GITHUB_ENV
           fi
 
-          # Determine BASE_BRANCH for comparison / PR target:
-          # - If manual dispatch provided environment, use that as base
-          # - Otherwise default to 'dev' for push runs (so feature pushes compare to dev)
+          # Resolve BASE_BRANCH (target for PR/comparison)
           if [ -n "${{ github.event.inputs.environment }}" ]; then
-            echo "Using workflow_dispatch input environment='${{ github.event.inputs.environment }}'"
             echo "BASE_BRANCH=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
           else
             echo "BASE_BRANCH=dev" >> $GITHUB_ENV
@@ -76,9 +71,14 @@ jobs:
         run: |
           set -e
           echo "Manual dispatch: fetching feature branch '${{ env.FEATURE_BRANCH }}'"
-          git fetch origin "${{ env.FEATURE_BRANCH }}" || true
-          # checkout the remote branch if it exists, otherwise create local branch name
-          git checkout -B "${{ env.FEATURE_BRANCH }}" "origin/${{ env.FEATURE_BRANCH }}" || git checkout -B "${{ env.FEATURE_BRANCH }}"
+          # If input uses owner:branch, only try to fetch local branch name (right side)
+          if [[ "${{ env.FEATURE_BRANCH }}" == *:* ]]; then
+            BRANCH="${{ env.FEATURE_BRANCH#*: }}"
+          else
+            BRANCH="${{ env.FEATURE_BRANCH }}"
+          fi
+          git fetch origin "${BRANCH}" || true
+          git checkout -B "${BRANCH}" "origin/${BRANCH}" || git checkout -B "${BRANCH}"
           git rev-parse --abbrev-ref HEAD
         shell: bash
 
@@ -91,7 +91,6 @@ jobs:
           git fetch origin "$BASE" || true
           CHANGED_FILES="$(git diff --name-only origin/${BASE}...HEAD || true)"
 
-          # Write changed_files safely; if empty write an empty value
           if [ -z "$CHANGED_FILES" ]; then
             echo "changed_files=" >> "$GITHUB_OUTPUT"
           else
@@ -102,12 +101,11 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-          # Count non-empty lines for the change_count
           CHANGE_COUNT=$(printf '%s\n' "$CHANGED_FILES" | grep -cve '^\s*$' || true)
           echo "change_count=$CHANGE_COUNT" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Create Deployment PR (if applicable)
+      - name: Create Deployment PR (validate head exists first)
         if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
         uses: actions/github-script@v7
         env:
@@ -119,28 +117,80 @@ jobs:
           CHANGE_COUNT: ${{ steps.changes.outputs.change_count }}
         with:
           script: |
-            // Resolve inputs
-            const featureBranch = process.env.FEATURE_BRANCH && process.env.FEATURE_BRANCH.trim();
-            const baseBranch = process.env.BASE_BRANCH && process.env.BASE_BRANCH.trim() ? process.env.BASE_BRANCH.trim() : 'dev';
-            const changedFiles = process.env.CHANGED_FILES
-              ? process.env.CHANGED_FILES.split('\n').filter(Boolean)
-              : [];
-            const changeCount = Number(process.env.CHANGE_COUNT || changedFiles.length || 0);
+            // Resolve feature branch input
+            const rawFeature = (process.env.FEATURE_BRANCH || '').trim();
+            if (!rawFeature) throw new Error('FEATURE_BRANCH is empty. Provide a valid branch name.');
 
-            if (!featureBranch) {
-              throw new Error(`FEATURE_BRANCH is empty — cannot create pull request.`);
+            // Support "owner:branch" (for forks) or just "branch"
+            let owner = context.repo.owner;
+            let headBranchName = rawFeature;
+            let headParam = rawFeature; // default sent to PR API
+
+            if (rawFeature.includes(':')) {
+              const parts = rawFeature.split(':');
+              if (parts.length !== 2 || !parts[0] || !parts[1]) {
+                throw new Error('feature_branch must be "owner:branch" if using a fork; invalid format: ' + rawFeature);
+              }
+              owner = parts[0];
+              headBranchName = parts[1];
+              headParam = `${owner}:${headBranchName}`;
             }
 
-            // If no changes, skip PR creation
+            // Validate the head branch exists
+            try {
+              // If owner is the same repo owner, check branch in the current repo
+              if (owner === context.repo.owner) {
+                await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: headBranchName
+                });
+              } else {
+                // Validate branch exists in the other owner's repo (likely a fork)
+                await github.rest.repos.getBranch({
+                  owner,
+                  repo: context.repo.repo,
+                  branch: headBranchName
+                });
+              }
+            } catch (err) {
+              // Provide a clear error for the user
+              throw new Error(
+                `The specified source branch "${rawFeature}" does not exist or is not accessible. ` +
+                `If the branch lives in a fork, provide it as "owner:branch" and ensure the branch/repo is public or the token has access.`
+              );
+            }
+
+            // Prepare changed files list and count
+            const changedFiles = process.env.CHANGED_FILES ? process.env.CHANGED_FILES.split('\n').filter(Boolean) : [];
+            const changeCount = Number(process.env.CHANGE_COUNT || changedFiles.length || 0);
+
             if (changeCount === 0) {
-              console.log(`No changes detected vs ${baseBranch} — skipping PR creation.`);
+              console.log(`No changes detected vs ${process.env.BASE_BRANCH || 'dev'} — skipping PR creation.`);
               return;
             }
 
-            // Compose PR body safely (avoid embedding backticks/template-literals inside YAML)
+            // Determine base branch (use BASE_BRANCH env resolved earlier)
+            const baseBranch = (process.env.BASE_BRANCH && process.env.BASE_BRANCH.trim()) || 'dev';
+
+            // Avoid duplicate PRs
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: headParam,
+              base: baseBranch,
+              state: 'open'
+            });
+
+            if (existing.data && existing.data.length > 0) {
+              console.log(`Open PR already exists: ${existing.data[0].html_url}`);
+              return;
+            }
+
+            // Compose PR body
             const prBodyLines = [
               `## Feature Deployment to ${baseBranch.toUpperCase()}`,
-              `**Source Branch:** ${featureBranch}`,
+              `**Source Branch:** ${rawFeature}`,
               `**Target Environment:** ${baseBranch.toUpperCase()}`,
               `**Deployment Reason:** ${process.env.DEPLOYMENT_REASON || 'Automated PR'}`,
               '',
@@ -153,27 +203,13 @@ jobs:
             ];
             const prBody = prBodyLines.join('\n');
 
-            // Avoid creating duplicate PRs from the same head -> base
-            const existing = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              head: `${context.repo.owner}:${featureBranch}`,
-              base: baseBranch,
-              state: 'open'
-            });
-
-            if (existing.data && existing.data.length > 0) {
-              console.log(`Open PR already exists: ${existing.data[0].html_url}`);
-              return;
-            }
-
-            // Create the PR
+            // Create PR
             const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🚀 ${baseBranch.toUpperCase()}: Merge ${featureBranch} -> ${baseBranch}`,
+              title: `🚀 ${baseBranch.toUpperCase()}: Merge ${rawFeature} -> ${baseBranch}`,
               body: prBody,
-              head: featureBranch,
+              head: headParam,
               base: baseBranch
             });
 
